@@ -25,6 +25,14 @@ yarn-error.log*
 dist/
 build/
 
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# Claude Code internals
+.claude/
+
 # Misc
 .DS_Store
 .env

@@ -1,102 +1,164 @@
-import { useState } from "react"
+import { useCallback, useEffect, useState } from "react"
+import type { Backend, Task } from "./types"
+import { api } from "./api"
+import TaskForm from "./components/TaskForm"
+import TaskList from "./components/TaskList"
 
-type FetchState = {
-  message: string | null
-  loading: boolean
-  error: string | null
+const BACKENDS: Record<Backend, { label: string; port: number; color: string }> = {
+  fastapi: { label: "FastAPI", port: 8000, color: "#009688" },
+  nodejs:  { label: "Node.js", port: 3001, color: "#3c873a" },
 }
 
-const initialState: FetchState = { message: null, loading: false, error: null }
+export default function App() {
+  const [backend, setBackend]   = useState<Backend>("fastapi")
+  const [tasks, setTasks]       = useState<Task[]>([])
+  const [loading, setLoading]   = useState(false)
+  const [error, setError]       = useState<string | null>(null)
 
-function App() {
-  const [fastapi, setFastapi] = useState<FetchState>(initialState)
-  const [node, setNode] = useState<FetchState>(initialState)
-  const [streamChunks, setStreamChunks] = useState<string[]>([])
-  const [streaming, setStreaming] = useState(false)
-  const [streamError, setStreamError] = useState<string | null>(null)
+  const cfg = BACKENDS[backend]
 
-  const fetchFrom = async (
-    url: string,
-    setState: React.Dispatch<React.SetStateAction<FetchState>>
-  ) => {
-    setState({ message: null, loading: true, error: null })
+  // --- data fetching ---
+
+  const fetchTasks = useCallback(async () => {
+    setLoading(true)
+    setError(null)
     try {
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP error: ${res.status}`)
-      const data = await res.json()
-      setState({ message: data.msg, loading: false, error: null })
+      setTasks(await api.getTasks(backend))
     } catch (err) {
-      setState({
-        message: null,
-        loading: false,
-        error: err instanceof Error ? err.message : "Unknown error",
-      })
-    }
-  }
-
-  const fetchStream = async () => {
-    setStreamChunks([])
-    setStreamError(null)
-    setStreaming(true)
-    try {
-      const res = await fetch("http://127.0.0.1:8000/stream")
-      if (!res.ok) throw new Error(`HTTP error: ${res.status}`)
-      const reader = res.body!.getReader()
-      const decoder = new TextDecoder()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const text = decoder.decode(value, { stream: true }).trim()
-        if (text) setStreamChunks((prev) => [...prev, text])
-      }
-    } catch (err) {
-      setStreamError(err instanceof Error ? err.message : "Unknown error")
+      setError(err instanceof Error ? err.message : "Failed to fetch tasks")
     } finally {
-      setStreaming(false)
+      setLoading(false)
+    }
+  }, [backend])
+
+  useEffect(() => { fetchTasks() }, [fetchTasks])
+
+  // --- mutations ---
+
+  async function handleCreate(title: string, description: string) {
+    try {
+      const task = await api.createTask(backend, { title, description })
+      setTasks(prev => [task, ...prev])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create task")
     }
   }
+
+  async function handleToggle(id: number, completed: boolean) {
+    try {
+      const updated = await api.updateTask(backend, id, { completed })
+      setTasks(prev => prev.map(t => t.id === id ? updated : t))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update task")
+    }
+  }
+
+  async function handleEdit(id: number, title: string, description: string) {
+    try {
+      const updated = await api.updateTask(backend, id, { title, description })
+      setTasks(prev => prev.map(t => t.id === id ? updated : t))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update task")
+    }
+  }
+
+  async function handleDelete(id: number) {
+    try {
+      await api.deleteTask(backend, id)
+      setTasks(prev => prev.filter(t => t.id !== id))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete task")
+    }
+  }
+
+  // --- render ---
 
   return (
-    <div style={{ padding: "2rem", fontFamily: "sans-serif", display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+    <div style={{ minHeight: "100vh", background: "#f0f2f5", fontFamily: "system-ui, sans-serif" }}>
 
-      <div>
-        <button
-          onClick={() => fetchFrom("http://127.0.0.1:8000/tillu", setFastapi)}
-          disabled={fastapi.loading}
-        >
-          {fastapi.loading ? "Loading..." : "Fetch from FastAPI"}
-        </button>
-        {fastapi.message && <p style={{ color: "green" }}>FastAPI: {fastapi.message}</p>}
-        {fastapi.error && <p style={{ color: "red" }}>Error: {fastapi.error}</p>}
-      </div>
+      {/* Header */}
+      <header style={{
+        background: cfg.color,
+        color: "white",
+        padding: "0.9rem 1.5rem",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        boxShadow: "0 2px 6px rgba(0,0,0,0.15)",
+      }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: "1.2rem", letterSpacing: "-0.3px" }}>CrudOps</div>
+          <div style={{ fontSize: "0.75rem", opacity: 0.8 }}>React + {cfg.label} + SQLite</div>
+        </div>
 
-      <div>
-        <button
-          onClick={() => fetchFrom("http://127.0.0.1:3001/tillu", setNode)}
-          disabled={node.loading}
-        >
-          {node.loading ? "Loading..." : "Fetch from Node.js"}
-        </button>
-        {node.message && <p style={{ color: "blue" }}>Node.js: {node.message}</p>}
-        {node.error && <p style={{ color: "red" }}>Error: {node.error}</p>}
-      </div>
+        {/* Backend toggle */}
+        <div style={{ display: "flex", gap: "0.4rem" }}>
+          {(Object.keys(BACKENDS) as Backend[]).map(b => (
+            <button
+              key={b}
+              onClick={() => setBackend(b)}
+              style={{
+                padding: "0.35rem 0.9rem",
+                borderRadius: "999px",
+                border: "2px solid white",
+                background: backend === b ? "white" : "transparent",
+                color: backend === b ? cfg.color : "white",
+                fontWeight: 700,
+                cursor: "pointer",
+                fontSize: "0.82rem",
+                transition: "all 0.15s",
+              }}
+            >
+              {BACKENDS[b].label}
+            </button>
+          ))}
+        </div>
+      </header>
 
-      <div>
-        <button onClick={fetchStream} disabled={streaming}>
-          {streaming ? "Streaming..." : "Start Stream (FastAPI yield)"}
-        </button>
-        {streamError && <p style={{ color: "red" }}>Error: {streamError}</p>}
-        {streamChunks.length > 0 && (
-          <div style={{ marginTop: "0.75rem", background: "#1e1e1e", color: "#00ff99", padding: "1rem", borderRadius: "6px", fontFamily: "monospace" }}>
-            {streamChunks.map((chunk, i) => (
-              <div key={i}>{chunk}</div>
-            ))}
+      {/* Body */}
+      <main style={{ maxWidth: "680px", margin: "1.5rem auto", padding: "0 1rem" }}>
+
+        {/* Active backend info */}
+        <div style={{
+          background: "white",
+          borderRadius: "8px",
+          padding: "0.6rem 1rem",
+          marginBottom: "0.9rem",
+          fontSize: "0.8rem",
+          color: "#666",
+          borderLeft: `4px solid ${cfg.color}`,
+          boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+        }}>
+          <strong style={{ color: cfg.color }}>{cfg.label}</strong>
+          &nbsp;→&nbsp;
+          <code style={{ background: "#f5f5f5", padding: "0.1rem 0.4rem", borderRadius: "3px" }}>
+            http://127.0.0.1:{cfg.port}/tasks
+          </code>
+          &nbsp;— switch the toggle above to compare both backends on the same data.
+        </div>
+
+        <TaskForm onSubmit={handleCreate} accentColor={cfg.color} />
+
+        {error && (
+          <div style={{
+            background: "#ffebee", color: "#c62828",
+            padding: "0.7rem 1rem", borderRadius: "8px",
+            marginBottom: "0.9rem", fontSize: "0.88rem",
+          }}>
+            {error}
           </div>
         )}
-      </div>
 
+        <TaskList
+          tasks={tasks}
+          loading={loading}
+          accentColor={cfg.color}
+          onToggle={handleToggle}
+          onEdit={handleEdit}
+          onDelete={handleDelete}
+          onRefresh={fetchTasks}
+        />
+      </main>
     </div>
   )
 }
-
-export default App
