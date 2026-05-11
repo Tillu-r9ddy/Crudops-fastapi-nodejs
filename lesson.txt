@@ -1,0 +1,603 @@
+The Big Picture First
+Before any code, understand what you built:
+
+
+Browser (React)
+    ↕  HTTP requests
+FastAPI (Python, port 8000)  ←→  tasks.db (SQLite file on disk)
+Node.js (Express, port 3001) ←→  tasks.db (SAME file)
+React is the face. FastAPI and Node.js are two backends doing the exact same job differently, sharing one database. The database is a single file called tasks.db. This architecture lets you compare how Python and JavaScript solve identical problems.
+
+Part 1 — The Database Layer (SQLite)
+Before explaining the backends, you need to understand what SQLite is, because both backends talk to it.
+
+SQLite is a database that lives in a single file (tasks.db) on your hard drive. No separate server needed — the file IS the database. Perfect for learning.
+
+The tasks table looks like this:
+
+
+| id | title       | description  | completed | created_at          |
+|----|-------------|--------------|-----------|---------------------|
+|  1 | Buy milk    | from store   | 0         | 2026-05-11T08:00:00 |
+|  2 | Learn React |              | 1         | 2026-05-11T09:00:00 |
+That's it. Five columns. Everything you build revolves around reading and writing this table.
+
+Part 2 — FastAPI Backend (backend/main.py)
+The imports (lines 1–11)
+
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+asyncio — Python's library for writing async code. Used only for the streaming demo at the bottom.
+datetime, timezone — For recording when a task was created. timezone.utc means we store time in UTC (universal time, not your local time).
+Path — Python's modern way to work with file paths. Cross-platform. Path("a") / "b" works on Windows and Mac alike.
+Optional — A type hint. Optional[str] means the value can be a string OR None.
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+FastAPI — The web framework class. You create one instance called app.
+Depends — FastAPI's dependency injection system. You'll see it used to give each route a database connection.
+HTTPException — How you manually send error responses (like 404 Not Found).
+CORSMiddleware — CORS stands for Cross-Origin Resource Sharing. The browser will BLOCK your React app (on port 5173) from calling your API (on port 8000) unless the API explicitly says "I allow requests from other origins." This middleware does that.
+StreamingResponse — Sends data in pieces instead of all at once. Used in the /stream demo.
+
+from pydantic import BaseModel, field_validator
+pydantic — A validation library. You define what your data should look like (a schema), and Pydantic automatically validates and parses incoming data. If someone sends {"title": 123} instead of {"title": "buy milk"}, Pydantic catches it.
+
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+SQLAlchemy — An ORM (Object Relational Mapper). Instead of writing raw SQL like SELECT * FROM tasks, you write Python like db.query(TaskModel).all(). SQLAlchemy translates your Python into SQL.
+Column, Integer, String, Boolean, DateTime — These describe each column in your table.
+create_engine — Creates the connection to the database file.
+event — Lets you hook into SQLAlchemy events (like "on every new connection, run this code").
+Session — A unit of work with the database. Open, do stuff, close.
+sessionmaker — A factory that produces Session objects.
+Database setup (lines 17–47)
+
+_DB_PATH = Path(__file__).parent.parent / "tasks.db"
+DATABASE_URL = f"sqlite:///{_DB_PATH}"
+__file__ is Python's built-in variable that holds the path to the current file. So __file__ = ...CRUDOPS/backend/main.py.
+.parent goes one folder up → ...CRUDOPS/backend/
+.parent again → ...CRUDOPS/
+/ "tasks.db" adds the filename → ...CRUDOPS/tasks.db
+The URL format sqlite:/// is how SQLAlchemy identifies SQLite. Three slashes + absolute path.
+Why not just write the path directly? Because the path depends on where the project lives on your machine. Using __file__ makes it work on any machine automatically.
+
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+create_engine sets up the database connection pool. Think of it as the "bridge" between Python and the file.
+check_same_thread=False — SQLite by default only allows one thread to use the same connection. FastAPI uses multiple threads, so we disable this restriction.
+
+@event.listens_for(engine, "connect")
+def set_wal_mode(dbapi_conn, _):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+@event.listens_for(engine, "connect") — This is a decorator. Every time a new connection to the database is opened, this function automatically runs.
+PRAGMA journal_mode=WAL — WAL = Write-Ahead Log. A SQLite setting that allows one process to write while another is reading at the same time. Without this, FastAPI and Node.js would fight over the database file and one would get a "database is locked" error.
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+sessionmaker creates a factory. Every time you call SessionLocal(), you get a fresh database session.
+autocommit=False — Changes are NOT saved automatically. You must call db.commit() explicitly. This gives you control over transactions.
+autoflush=False — SQLAlchemy won't automatically write pending changes before queries.
+
+class Base(DeclarativeBase):
+    pass
+Base is the parent class all your database models inherit from. SQLAlchemy uses it to track all your tables.
+The ORM Model (lines 37–47)
+
+class TaskModel(Base):
+    __tablename__ = "tasks"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    title       = Column(String, nullable=False)
+    description = Column(String, default="")
+    completed   = Column(Boolean, default=False)
+    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+This Python class maps directly to the tasks table in SQLite. Each attribute = one column.
+
+__tablename__ = "tasks" — Tells SQLAlchemy the actual SQL table name.
+Column(Integer, primary_key=True, index=True) — id is an auto-incrementing integer. primary_key=True means SQLite will assign 1, 2, 3... automatically. index=True makes lookups by id faster.
+Column(String, nullable=False) — title must always have a value. Cannot be NULL.
+default="" — If description isn't provided, store empty string.
+default=lambda: datetime.now(timezone.utc) — A lambda (anonymous function). Called each time a row is created to get the current UTC time. We use a lambda (not just datetime.now(timezone.utc)) because otherwise Python would calculate the time once when the file loads, not at insert time.
+
+Base.metadata.create_all(bind=engine)
+This is very important. When FastAPI starts, this line looks at all your models (TaskModel), checks if the tasks table exists, and creates it if it doesn't. It's like running CREATE TABLE IF NOT EXISTS automatically.
+
+Pydantic Schemas (lines 53–76)
+Here's the key concept: ORM models are for talking to the database. Pydantic models are for talking to the outside world (HTTP requests/responses). They're different things.
+
+
+class TaskCreate(BaseModel):
+    title: str
+    description: str = ""
+When someone sends a POST request to create a task, the JSON body must look like {"title": "buy milk"}. Pydantic parses it into a TaskCreate object. description is optional (defaults to "").
+
+
+class TaskUpdate(BaseModel):
+    title:       Optional[str]  = None
+    description: Optional[str]  = None
+    completed:   Optional[bool] = None
+For updating, ALL fields are optional (you might only want to toggle completed without changing the title). Optional[str] = None means: this field might not be sent at all.
+
+
+class TaskOut(BaseModel):
+    id:          int
+    title:       str
+    description: str = ""
+    completed:   bool = False
+    created_at:  Optional[datetime] = None
+
+    @field_validator("completed", mode="before")
+    @classmethod
+    def coerce_completed(cls, v):
+        return bool(v) if v is not None else False
+
+    model_config = {"from_attributes": True}
+TaskOut is what FastAPI sends back to the browser in the response.
+
+@field_validator("completed", mode="before") — Before Pydantic validates the completed field, run this function. mode="before" means it runs on the raw incoming value.
+coerce_completed — SQLite stores booleans as integers (0 or 1). This validator converts 0 → False, 1 → True, None → False. Without this, Pydantic would reject SQLite's integers.
+model_config = {"from_attributes": True} — Allows Pydantic to read from SQLAlchemy model instances (which have attribute access like task.title) instead of requiring a plain dictionary.
+App and CORS (lines 82–94)
+
+app = FastAPI(title="CrudOps — FastAPI")
+Creates the FastAPI application. title shows up in the auto-generated docs at http://127.0.0.1:8000/docs.
+
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+allow_origins=["*"] — Allow requests from ANY domain. In production you'd put ["https://yoursite.com"] here.
+["*"] for methods and headers means: allow all HTTP methods (GET, POST, PUT, DELETE) and all request headers.
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+This is a generator function (notice yield not return). It's FastAPI's dependency injection pattern for database sessions.
+
+Opens a new session with SessionLocal()
+yield db — passes the session to the route handler that needs it, pauses here
+After the route finishes (success OR error), Python resumes after yield and runs db.close() in the finally block
+The finally guarantees the session is ALWAYS closed, even if an exception happened
+Routes — The 5 CRUD Endpoints (lines 100–150)
+GET / — root
+
+
+@app.get("/")
+def root():
+    return {"msg": "CrudOps FastAPI is running"}
+A health check. Visit http://127.0.0.1:8000/ in your browser to confirm the server is up.
+
+GET /tasks — Read All
+
+
+@app.get("/tasks", response_model=list[TaskOut])
+def get_tasks(db: Session = Depends(get_db)):
+    return db.query(TaskModel).order_by(TaskModel.created_at.desc()).all()
+response_model=list[TaskOut] — FastAPI will validate and serialize the return value using TaskOut for each item. Only the fields defined in TaskOut will be included in the response.
+db: Session = Depends(get_db) — FastAPI sees Depends(get_db) and automatically calls get_db(), takes the yielded session, and passes it as db. This is dependency injection — you don't create the session yourself.
+db.query(TaskModel) — Start a SELECT query on the tasks table.
+.order_by(TaskModel.created_at.desc()) — ORDER BY created_at DESC (newest first).
+.all() — Execute and return all matching rows as a list.
+GET /tasks/{task_id} — Read One
+
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def get_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+{task_id} in the path — FastAPI extracts this from the URL and passes it as the task_id parameter. If the URL is /tasks/5, then task_id = 5.
+task_id: int — FastAPI automatically converts the string from the URL to an integer. If someone sends /tasks/abc, FastAPI returns 422 (Unprocessable Entity) automatically.
+.filter(TaskModel.id == task_id).first() — WHERE id = task_id, get the first (and only) result, or None if not found.
+raise HTTPException(status_code=404, ...) — If no task found, stop here and return a 404 response.
+POST /tasks — Create
+
+
+@app.post("/tasks", response_model=TaskOut, status_code=201)
+def create_task(body: TaskCreate, db: Session = Depends(get_db)):
+    task = TaskModel(**body.model_dump())
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+body: TaskCreate — FastAPI reads the JSON request body and validates it into a TaskCreate object automatically.
+status_code=201 — HTTP 201 means "Created". More semantically correct than 200 for a new resource.
+body.model_dump() — Converts the Pydantic model to a plain Python dictionary: {"title": "buy milk", "description": ""}.
+TaskModel(**body.model_dump()) — ** unpacks the dict into keyword arguments. Same as TaskModel(title="buy milk", description="").
+db.add(task) — Tells SQLAlchemy "remember this new row".
+db.commit() — Actually writes it to the database file.
+db.refresh(task) — After commit, the database fills in auto-generated values (like id and created_at). refresh re-reads the row so the Python object has these values.
+PUT /tasks/{task_id} — Update
+
+
+@app.put("/tasks/{task_id}", response_model=TaskOut)
+def update_task(task_id: int, body: TaskUpdate, db: Session = Depends(get_db)):
+    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    for field, value in body.model_dump(exclude_none=True).items():
+        setattr(task, field, value)
+    db.commit()
+    db.refresh(task)
+    return task
+body.model_dump(exclude_none=True) — Converts to dict but skips fields that are None. If the frontend only sends {"completed": true}, the dict is just {"completed": True} — title and description are excluded, so they won't be overwritten.
+for field, value in ...items() — Loops over each sent field.
+setattr(task, field, value) — Dynamically sets the attribute. Same as task.completed = True but works for any field name.
+DELETE /tasks/{task_id} — Delete
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    db.delete(task)
+    db.commit()
+status_code=204 — HTTP 204 means "No Content". Deletion succeeded, nothing to send back. That's why there's no return statement.
+db.delete(task) — Marks the object for deletion.
+db.commit() — Executes the DELETE SQL.
+Streaming Demo (lines 157–165)
+
+async def count_generator():
+    for i in range(1, 11):
+        yield f"chunk {i} of 10\n"
+        await asyncio.sleep(0.5)
+
+@app.get("/stream")
+async def stream():
+    return StreamingResponse(count_generator(), media_type="text/plain")
+async def — This is an asynchronous function. Instead of blocking the whole server while waiting, it yields control back.
+yield makes count_generator an async generator — it produces values one at a time.
+await asyncio.sleep(0.5) — Wait 0.5 seconds without blocking other requests.
+StreamingResponse — Instead of sending one big response, the browser receives data in chunks as they're produced. You saw this in the black box on screen showing "chunk 1 of 10... chunk 2 of 10..."
+Part 3 — Node.js Backend (backend-node/server.js)
+This backend does the exact same job as FastAPI, but in JavaScript. Compare them side by side to see how the two languages approach the same problem.
+
+Imports (lines 1–4)
+
+const express  = require("express")
+const cors     = require("cors")
+const Database = require("better-sqlite3")
+const path     = require("path")
+require() is Node.js's way to import packages (equivalent to Python's import).
+express — The web framework (equivalent to FastAPI).
+cors — A package that adds CORS headers (equivalent to CORSMiddleware).
+better-sqlite3 — A SQLite library for Node.js. It's synchronous (no callbacks, no promises) — you call a function and immediately get a result back. This makes it simpler to learn.
+path — Node.js built-in for working with file paths.
+Database setup (lines 10–23)
+
+const db = new Database(path.join(__dirname, "../tasks.db"))
+__dirname — Node.js built-in variable, like Python's __file__. It's the directory of the current file (...CRUDOPS/backend-node).
+path.join(__dirname, "../tasks.db") — Joins path parts safely. Result: ...CRUDOPS/tasks.db. Same file as FastAPI uses.
+new Database(...) — Opens (or creates) the SQLite file.
+
+db.pragma("journal_mode = WAL")
+Same WAL mode as FastAPI. Both backends set this so they can coexist on the same file.
+
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    completed   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  )
+`)
+This is raw SQL — no ORM here. Node.js creates the table directly.
+
+CREATE TABLE IF NOT EXISTS — Only creates if it doesn't already exist. If FastAPI created it first, this is a no-op.
+AUTOINCREMENT — SQLite auto-assigns 1, 2, 3... for each new row.
+NOT NULL DEFAULT '' — Column cannot be null, defaults to empty string.
+completed INTEGER — SQLite has no boolean type. We store 0 for false, 1 for true.
+strftime('%Y-%m-%dT%H:%M:%SZ', 'now') — SQLite's function to get the current time as an ISO string like 2026-05-11T08:00:00Z.
+The normalise function (lines 36–38)
+
+function normalise(task) {
+  return { ...task, completed: Boolean(task.completed) }
+}
+SQLite returns completed as 0 or 1 (integers). The React frontend expects true or false (booleans).
+{ ...task } — The spread operator copies all properties of task into a new object.
+completed: Boolean(task.completed) — Overwrites the completed property with a real boolean. Boolean(0) = false, Boolean(1) = true.
+Express app setup (lines 29–33)
+
+const app  = express()
+const PORT = 3001
+
+app.use(cors())
+app.use(express.json())
+express() — Creates the app, same as FastAPI().
+app.use(cors()) — Adds CORS headers to all responses.
+app.use(express.json()) — Tells Express to automatically parse JSON request bodies. Without this, req.body would be undefined when someone sends {"title": "buy milk"}.
+Routes (lines 44–101)
+GET /tasks
+
+
+app.get("/tasks", (_req, res) => {
+  const tasks = db.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all()
+  res.json(tasks.map(normalise))
+})
+db.prepare(...) — Prepares a SQL statement (compiles it once for reuse).
+.all() — Executes and returns all rows as an array of plain objects.
+tasks.map(normalise) — Applies the normalise function to every task, converting 0/1 to false/true.
+_req — The underscore convention says "I know this parameter exists but I don't use it".
+POST /tasks — Create
+
+
+app.post("/tasks", (req, res) => {
+  const { title, description = "" } = req.body
+  if (!title || !title.trim()) {
+    return res.status(400).json({ error: "title is required" })
+  }
+  const result = db
+    .prepare("INSERT INTO tasks (title, description) VALUES (?, ?)")
+    .run(title.trim(), description.trim())
+  const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(result.lastInsertRowid)
+  res.status(201).json(normalise(task))
+})
+const { title, description = "" } = req.body — Destructuring. Extracts title and description from the request body. If description is missing, defaults to "".
+? in the SQL — Parameterized query. SQLite replaces ? with the actual values safely. Never concatenate user input directly into SQL — that's SQL injection.
+.run(...) — Executes an INSERT/UPDATE/DELETE (not a SELECT).
+result.lastInsertRowid — The auto-generated id of the just-inserted row.
+PUT /tasks/:id — Update
+
+
+const title       = req.body.title       ?? task.title
+const description = req.body.description ?? task.description
+const completed   = req.body.completed   !== undefined
+    ? (req.body.completed ? 1 : 0)
+    : task.completed
+?? is the nullish coalescing operator. a ?? b means: use a if it's not null/undefined, otherwise use b. This lets partial updates work — if you don't send title, it keeps the existing one.
+req.body.completed !== undefined ? ... : ... — A ternary expression. For completed we need extra care: convert JS true/false to SQLite 1/0.
+Part 4 — Frontend: TypeScript Types (src/types.ts)
+
+export type Backend = "fastapi" | "nodejs"
+A union type. A variable of type Backend can ONLY be the string "fastapi" or "nodejs". TypeScript will give a compile error if you try to assign anything else. This prevents typos.
+
+
+export interface Task {
+  id: number
+  title: string
+  description: string
+  completed: boolean
+  created_at: string
+}
+An interface is a contract — it defines the shape of an object. This mirrors exactly what the backend APIs return. Every task object in your React code must have these fields.
+
+
+export interface TaskUpdatePayload {
+  title?: string
+  description?: string
+  completed?: boolean
+}
+The ? after a field name means it's optional. When updating, you might only send one of these fields.
+
+Part 5 — Frontend: API Layer (src/api.ts)
+This file is a clean abstraction — it hides all the raw fetch details from the rest of your app.
+
+
+const BASE: Record<Backend, string> = {
+  fastapi: "http://127.0.0.1:8000",
+  nodejs: "http://127.0.0.1:3001",
+}
+Record<Backend, string> — A TypeScript type that says "an object where every key is a Backend and every value is a string". TypeScript will error if you forget one of the backends.
+
+
+async function request<T>(backend: Backend, path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE[backend]}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  })
+  if (res.status === 204) return undefined as T
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.detail ?? data.error ?? `HTTP ${res.status}`)
+  return data
+}
+<T> — A generic. T is a placeholder type. When you call request<Task[]>(...), TypeScript knows the return type is Task[]. This gives you type safety throughout.
+init?: RequestInit — The ? means optional. RequestInit is the browser's built-in type for fetch options (method, body, headers, etc.).
+...init — Spread operator. Merges init's properties into the options object. If init has method: "POST", it gets added.
+if (res.status === 204) return undefined as T — DELETE returns 204 No Content (no JSON body). We return undefined and tell TypeScript "trust me, this is the right type".
+data.detail ?? data.error — FastAPI uses detail for errors. Node.js uses error. The ?? tries detail first, falls back to error.
+
+export const api = {
+  getTasks:   (b) => request<Task[]>(b, "/tasks"),
+  createTask: (b, payload) => request<Task>(b, "/tasks", { method: "POST", body: JSON.stringify(payload) }),
+  updateTask: (b, id, payload) => request<Task>(b, `/tasks/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
+  deleteTask: (b, id) => request<void>(b, `/tasks/${id}`, { method: "DELETE" }),
+}
+These four functions are the only thing the rest of the app uses to talk to the backend. Clean, named, typed.
+
+Part 6 — Frontend: Root Component (src/App.tsx)
+State (lines 13–16)
+
+const [backend, setBackend]   = useState<Backend>("fastapi")
+const [tasks, setTasks]       = useState<Task[]>([])
+const [loading, setLoading]   = useState(false)
+const [error, setError]       = useState<string | null>(null)
+useState is React's way to make a component remember values between renders.
+
+useState<Backend>("fastapi") — backend starts as "fastapi". When you call setBackend("nodejs"), React re-renders the component with the new value.
+useState<Task[]>([]) — tasks starts as an empty array.
+string | null — TypeScript union type. error is either a string or nothing.
+Fetching data (lines 22–34)
+
+const fetchTasks = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      setTasks(await api.getTasks(backend))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch tasks")
+    } finally {
+      setLoading(false)
+    }
+  }, [backend])
+
+useEffect(() => { fetchTasks() }, [fetchTasks])
+useCallback — Memoizes (caches) the function. Without it, fetchTasks would be a brand new function every render, causing the useEffect below to run infinitely. [backend] means: only create a new version of this function when backend changes.
+useEffect(() => { fetchTasks() }, [fetchTasks]) — Runs fetchTasks whenever fetchTasks changes. Since fetchTasks only changes when backend changes, this effectively means: fetch tasks whenever the active backend switches. This is how the page reloads data when you click the FastAPI/Node.js toggle.
+err instanceof Error ? err.message : ... — Errors in JavaScript can be anything. instanceof Error checks if it's a proper Error object so we can safely read .message.
+Mutations (lines 38–72)
+Each handler calls the API, then updates local state without re-fetching from the server:
+
+
+async function handleCreate(title: string, description: string) {
+  const task = await api.createTask(backend, { title, description })
+  setTasks(prev => [task, ...prev])  // add new task to FRONT of list
+}
+
+async function handleToggle(id: number, completed: boolean) {
+  const updated = await api.updateTask(backend, id, { completed })
+  setTasks(prev => prev.map(t => t.id === id ? updated : t))
+  // replace the one task, keep everything else
+}
+
+async function handleDelete(id: number) {
+  await api.deleteTask(backend, id)
+  setTasks(prev => prev.filter(t => t.id !== id))
+  // remove the deleted task from the list
+}
+prev => prev.filter(...) — This pattern using prev (the previous state) is important. React state updates can be asynchronous, so always use the function form when new state depends on old state.
+
+The backend toggle (lines 95–115)
+
+{(Object.keys(BACKENDS) as Backend[]).map(b => (
+  <button key={b} onClick={() => setBackend(b)} ...>
+    {BACKENDS[b].label}
+  </button>
+))}
+Object.keys(BACKENDS) — Gets ["fastapi", "nodejs"].
+.map(b => ...) — For each key, renders a button.
+key={b} — React requires a unique key on list items so it can efficiently update the DOM.
+onClick={() => setBackend(b)} — Clicking sets the active backend, which triggers the useEffect, which fetches tasks from the new backend.
+Part 7 — src/components/TaskForm.tsx
+
+export default function TaskForm({ onSubmit, accentColor }: Props) {
+  const [title, setTitle] = useState("")
+  const [description, setDescription] = useState("")
+This is a controlled component. The inputs don't manage their own value — React state does. Every keystroke calls setTitle, React updates state, React re-renders with the new value. The input always reflects the state.
+
+
+function handleSubmit(e: React.FormEvent) {
+  e.preventDefault()
+  if (!title.trim()) return
+  onSubmit(title.trim(), description.trim())
+  setTitle("")
+  setDescription("")
+}
+e.preventDefault() — Without this, submitting an HTML form would reload the page (browser default). We prevent that and handle it ourselves.
+onSubmit(...) — Calls the function passed down from App.tsx as a prop (handleCreate).
+After submitting, clears both inputs.
+
+const btn = (bg: string): React.CSSProperties => ({...})
+btn is a function that returns a style object. Since the button color changes based on which backend is active (teal for FastAPI, green for Node.js), you can't use a static style object — you call btn(accentColor) to get the right colored button.
+
+Part 8 — src/components/TaskList.tsx
+
+const done = tasks.filter(t => t.completed).length
+filter(t => t.completed) — Keeps only completed tasks.
+.length — Counts them. Used to show "3 open, 1 done".
+
+{loading && tasks.length === 0 ? (
+  <div>Fetching tasks…</div>
+) : tasks.length === 0 ? (
+  <div>No tasks yet. Add one above!</div>
+) : (
+  <div>
+    {tasks.map(task => <TaskItem key={task.id} task={task} ... />)}
+  </div>
+)}
+This is conditional rendering — what to show depends on the state:
+
+Currently loading AND no tasks yet → "Fetching tasks…"
+Not loading, but no tasks → "No tasks yet…"
+Has tasks → render each one with TaskItem
+Part 9 — src/components/TaskItem.tsx
+
+const [editing, setEditing] = useState(false)
+const [editTitle, setEditTitle] = useState(task.title)
+const [editDesc, setEditDesc] = useState(task.description)
+This component has two modes: view mode and edit mode, controlled by the editing boolean.
+
+
+if (editing) {
+  return ( /* edit form */ )
+}
+return ( /* view card */ )
+Early return pattern — if editing is true, render a completely different UI and return early. Otherwise fall through to the normal view.
+
+
+const formattedDate = task.created_at
+  ? new Date(task.created_at.endsWith("Z") ? task.created_at : task.created_at + "Z").toLocaleString()
+  : ""
+endsWith("Z") — Z at the end of a date string means UTC timezone. FastAPI returns dates without Z. Without appending Z, new Date() treats it as local time, which would show the wrong time.
+.toLocaleString() — Formats the date according to the user's local settings.
+
+<input
+  type="checkbox"
+  checked={task.completed}
+  onChange={() => onToggle(task.id, !task.completed)}
+  style={{ ..., accentColor } as React.CSSProperties}
+/>
+checked={task.completed} — The checkbox is controlled by React. Checked = true, unchecked = false.
+onChange={() => onToggle(task.id, !task.completed)} — When clicked, calls the parent's toggle function with the OPPOSITE of the current completed value.
+accentColor in the style — CSS accent-color property changes the checkbox's tick color to match the active backend's color.
+The Complete Flow — How Everything Connects
+Here's what happens when you type a task title and click "Add Task":
+
+
+1. TaskForm: user types in <input>
+      → onChange fires → setTitle("buy milk") → React re-renders
+
+2. TaskForm: user clicks "Add Task"
+      → handleSubmit fires → e.preventDefault()
+      → calls onSubmit("buy milk", "") which is App.handleCreate
+
+3. App.handleCreate:
+      → calls api.createTask("fastapi", { title: "buy milk", description: "" })
+
+4. api.ts request():
+      → fetch("http://127.0.0.1:8000/tasks", { method: "POST", body: '{"title":"buy milk","description":""}' })
+
+5. FastAPI receives POST /tasks:
+      → Pydantic validates body → creates TaskCreate { title: "buy milk", description: "" }
+      → get_db() opens a Session
+      → TaskModel(title="buy milk", description="") created
+      → db.add() + db.commit() → SQL: INSERT INTO tasks (title, description) VALUES (...)
+      → db.refresh() → row now has id=2, created_at=2026-05-11T...
+      → Returns TaskOut as JSON: { "id": 2, "title": "buy milk", ... }
+
+6. api.ts: fetch resolves → data parsed → returned as Task object
+
+7. App.handleCreate:
+      → setTasks(prev => [newTask, ...prev])
+      → React re-renders with the new task at the top of the list
+
+8. TaskList re-renders → TaskItem rendered for the new task → user sees it
+Key Concepts You've Learned
+Concept	Where you used it
+REST API (GET/POST/PUT/DELETE)	Both backends
+ORM (SQLAlchemy)	FastAPI main.py
+Raw SQL	Node.js server.js
+Pydantic validation	FastAPI TaskCreate, TaskOut
+Dependency Injection	FastAPI Depends(get_db)
+CORS	Both backends
+WAL mode (SQLite)	Both backends
+useState	Every React component
+useEffect	App.tsx — fetch on mount/switch
+useCallback	App.tsx — prevent infinite loops
+Controlled inputs	TaskForm.tsx, TaskItem.tsx
+Conditional rendering	TaskList.tsx
+Generic TypeScript	api.ts request<T>
+Props & component composition	All components
+Async/await	All API calls
+That's the entire project — from the SQLite file on disk, through two different backends, all the way to what you see in the browser.
